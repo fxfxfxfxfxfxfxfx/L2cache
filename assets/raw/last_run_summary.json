@@ -1,0 +1,17 @@
+{
+  "counts": {
+    "ok": 1432,
+    "failed": 0,
+    "skipped_memory_limit": 26,
+    "skipped_time_budget": 0,
+    "resumed": 0,
+    "anchors_stable": null
+  },
+  "stage": "full",
+  "seed": 20260803,
+  "cache_states": [
+    "steady"
+  ],
+  "elapsed_min": 50.94006378281241,
+  "timestamp": "2026-08-05T04:40:53.513966+00:00"
+}

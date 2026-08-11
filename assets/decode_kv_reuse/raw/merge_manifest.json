@@ -1,0 +1,10 @@
+{
+  "base_input": "assets/decode_kv_reuse/raw/results.jsonl",
+  "rerun_override_input": "assets/decode_kv_reuse_rerun/raw/results.jsonl",
+  "supplement_inputs": [
+    "assets/decode_kv_reuse_large_batch/raw/results.jsonl"
+  ],
+  "precedence": "rerun overrides matching base keys; supplements add or override",
+  "aggregate_rows": 92,
+  "paired_rows": 46
+}

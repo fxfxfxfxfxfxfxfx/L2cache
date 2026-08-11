@@ -1,0 +1,35 @@
+{
+  "histories": [
+    2048,
+    32768,
+    524288
+  ],
+  "passes": [
+    "ascending",
+    "descending"
+  ],
+  "shared_patterns": [
+    "shared_contiguous",
+    "shared_dispersed",
+    "independent_contiguous",
+    "independent_dispersed"
+  ],
+  "isolated_patterns": [
+    "isolated_contiguous",
+    "isolated_dispersed"
+  ],
+  "cache_states": [
+    "steady",
+    "l2-cold"
+  ],
+  "query_rows": [
+    64,
+    256
+  ],
+  "topk": 2048,
+  "l2_bytes": 52428800,
+  "flush_bytes": 268435456,
+  "warmup": 10,
+  "repeat": 30,
+  "seed": 20260810
+}

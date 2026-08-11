@@ -1,0 +1,27 @@
+{
+  "histories": [
+    65536,
+    262144,
+    524288
+  ],
+  "batches": [
+    1,
+    64
+  ],
+  "patterns": [
+    "shared",
+    "independent"
+  ],
+  "passes": [
+    "ascending",
+    "descending"
+  ],
+  "topk": 2048,
+  "l2_bytes": 52428800,
+  "flush_bytes": 268435456,
+  "warmup": 5,
+  "repeat": 50,
+  "seed": 20260810,
+  "timing": "identical 256 MiB flush immediately before every timed call",
+  "interpretation": "selected-KV reuse intervention; hardware L2 hit rates are not observed"
+}
