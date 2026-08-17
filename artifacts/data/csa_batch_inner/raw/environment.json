@@ -1,0 +1,43 @@
+{
+  "timestamp": "2026-08-13T07:52:48.454535+00:00",
+  "label": "H800 measured (local single-GPU benchmark)",
+  "seed": 20260803,
+  "gpu": {
+    "name": "NVIDIA H800 PCIe",
+    "uuid": "GPU-990c9120-d374-7b5a-0fe1-defc841ed362",
+    "memory_total": "81559 MiB",
+    "power_limit": "350.00 W",
+    "sm_clock_mhz": "1755 MHz",
+    "mem_clock_mhz": "1593 MHz",
+    "l2_cache_bytes": 52428800
+  },
+  "driver": {
+    "driver_version": "580.82.07"
+  },
+  "software": {
+    "python": "3.12.13",
+    "platform": "Linux-5.15.0-161-generic-x86_64-with-glibc2.35",
+    "torch": "2.9.1+cu128",
+    "torch_cuda": "12.8",
+    "flashinfer": "0.6.3",
+    "sglang_q8kv8": {
+      "sglang_commit": "5d85f25f75b6b6c937ac85bdc57ba0d19ebbbd7c",
+      "source_git_blob_sha1": {
+        "config.h": "f81b933655d46d6a63e1feb8e061873d56576667",
+        "defines.h": "fc6758ed98ab5c82136a44ba06779acef321585d",
+        "dense_fp8_transpose_v.h": "151100a3b43b6a05ef2d0cfd1c23d313d9475655",
+        "dense_fp8_utils.h": "3ddcfc1a6a20014364c839529eab86f524c909fb",
+        "entry.cuh": "0772b617357f327e58b5122b753a044a13d855cb",
+        "helpers.h": "6bed8ed988b1f14703a38f08d249ca03cda07235",
+        "kernel.cuh": "54bc2abdb751320a814e346aa8b5c42b5664924e",
+        "params.h": "5a522f04e083caaf0c72d537666d7ced2400800f"
+      }
+    }
+  },
+  "wheels": {},
+  "notes": [
+    "nvcc query failed: [Errno 2] No such file or directory: '/usr/local/cuda-13.0/bin/nvcc'",
+    "flash_mla version failed: No module named 'flash_mla'",
+    "pip freeze failed: [Errno 2] No such file or directory: '/root/L2cache/.venv/bin/pip'"
+  ]
+}

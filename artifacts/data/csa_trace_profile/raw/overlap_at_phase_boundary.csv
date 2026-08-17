@@ -1,0 +1,3 @@
+location,adjacent_overlap_count,adjacent_overlap_mean,adjacent_overlap_p10,adjacent_overlap_p50,adjacent_overlap_p90
+phase_boundary,861,0.7544937754065041,0.38671875,0.83984375,0.98046875
+phase_interior,128163,0.6857954598099686,0.357421875,0.744140625,0.90625

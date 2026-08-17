@@ -1,418 +1,245 @@
-# L2cache: H800 FlashMLA / SGLang Sparse MLA Benchmark
+# Sparse MLA Prefill 为何随历史 KV Cache 增长降速？
 
-## 测试设置
+> 固定 `topk=2048` 后，随机 index decode 的吞吐随可寻址历史增长保持稳定；
+> prefill 的吞吐变化与 query 间可复用的 KV 工作集，以及这些 query 在 kernel
+> 中的执行邻近性密切相关。
+
+本仓库是一份可复现的微型实验报告。它研究可寻址历史增长是否会引起 token 粒度
+稀疏访存的自然降速，以及 SGLang SM90 Q8×KV8 Sparse MLA prefill kernel 在
+历史 KV 从 2K 增长到 512K 时吞吐下降的真正来源。我们进一步用公开 CSA trace
+构造更接近真实激活规律的 index。
+
+## 摘要
+
+本文包含两个逐层推进的 insight。首先，固定 `topk=2048` 的随机 index decode
+在 H 从 4K 增长到 512K 时吞吐基本稳定。Token 粒度、非连续的 KV 访问可能具有
+固定的绝对开销；在这组实验中，扩大 index 的可寻址范围带来的吞吐波动低于
+`2.9%`。
+
+第二个 insight 聚焦 prefill。基线实验使用确定性的互质步长 index（图中记作
+random）。随着历史 KV 长度 H 从 2K 增长到 512K，kernel 完成相同数量
+selected-KV attention 计算所需的时间变长，因此 measured TFLOPS 下降。
+
+本文分别记录“计算量”和“数据访问模式”：实验始终固定 `topk=2048`，所以每个
+query 实际参与 attention 的 KV 数量始终保持 2,048，按 selected KV 计算的名义
+FLOPs 也保持固定。更大的 H 扩大了可被选择的 KV 地址范围，可能改变 index
+分布、单次调用访问的 unique KV 数量，以及各 query 之间的数据复用。对公开
+CSA trace 的统计进一步显示，相邻 query 的 selected-set overlap 会伴随 H 增长
+下降，同时真实激活呈现明显的短程相关性和连续 C4 簇集。
+
+我们先直接 replay 真实 trace 窗口，再将统计规律扩展到完整 `(B,H,Q)` 网格。
+CSA simulated/random TFLOPS 中位数为 `1.030x`。保持完全相同的逻辑 index，
+将 query row 从 batch-outer 改为 batch-inner 后，高负载
+`B>=64,Q>=512` 的吞吐降至 `0.778x`。结果支持：长 history 通过改变激活分布
+扩大单次 prefill 的 unique KV 工作集。Query-row 的执行组织决定这些复用能否
+被硬件有效利用。
+
+## 1. 问题与口径
+
+实验固定以下 kernel 形状：
+
+| 参数 | 值 |
+|---|---:|
+| Query heads | 64 |
+| Absorbed Q/K dim | 576 |
+| Value dim | 512 |
+| Selected KV / query | 2,048 |
+| Query/KV dtype | FP8 E4M3 |
+| Output dtype | BF16 |
+
+图中的吞吐是 selected-pair TFLOPS：
+
+```text
+FLOPs = 2 * B * Q * 2048 * 64 * (576 + 512)
+TFLOPS = FLOPs / sparse-kernel-time
+```
+
+因此横轴 H 增长时，分子保持固定，吞吐曲线的变化直接反映 kernel 时间变化。
+
+主要 prefill 数据来自同一套本机环境：
 
 | 项目 | 设置 |
 |---|---|
-| GPU | 单张 NVIDIA H800 SXM 80GB，SM90，700W power limit |
-| 软件 | Driver 580.126.20，CUDA 13.0.48，PyTorch 2.9.1+cu130 |
-| FlashMLA | commit `15f13e5030374295491c5ce31b02d7e63a7772c6`，仅编译 SM90 |
-| SGLang Q8×KV8 | commit `5d85f25f75b6b6c937ac85bdc57ba0d19ebbbd7c` 的原生 SM90 sparse prefill kernel |
-| 模型形状 | `h_q=64`，absorbed `d_qk=576`，`d_v=512`，`topk=2048` |
-| Softmax scale | `1/sqrt(256)`，对应 GLM-5.1 原始 `qk_head_dim=256` |
-| 端到端计时 | 每 case 10 次 warmup、30 次 CUDA event 测量，steady-state |
-| 图中 TFLOPS 计时 | 每个成功 case 进行 10 次 Kineto/CUDA profiler kernel 采样 |
-| Dense decode | FlashMLA BF16 `flash_mla_with_kvcache` |
-| Sparse decode | FlashMLA FP8-KV/BF16 compute，656 bytes/token |
-| Dense chunk | FlashMLA SM90 dense decode kernel 的 causal multi-query 模式 |
-| Sparse chunk | FlashMLA BF16 `flash_mla_sparse_fwd` |
-| Sparse Q8 chunk | SGLang `sparse_prefill_q8kv8`，FP8 Q + FP8 KV，BF16 output |
+| GPU | NVIDIA H800 PCIe 80GB，SM90，350W |
+| Driver / CUDA | 580.82.07 / PyTorch CUDA 12.8 |
+| PyTorch / FlashInfer | 2.9.1+cu128 / 0.6.3 |
+| Kernel | SGLang commit `5d85f25f75b6b6c937ac85bdc57ba0d19ebbbd7c` |
+| 计时 | 10 次 warmup，30 次 CUDA event，正序/倒序双 pass |
 
-FlashMLA 固定提交的支持矩阵没有 SM90 dense MLA prefill；它只有 SM90
-dense decode 和 sparse prefill。因此本报告没有使用 FA3 充当 dense 曲线。
-对 `Q>1`，dense 曲线明确使用 FlashMLA 的 SM90 dense decode kernel，设置
-`cache_seqlens=H+Q`、`causal=True`，使新增 token `i` 严格可见 `H+i+1`
-个 KV。这是 native FlashMLA causal multi-query 测量，不冒充官方 dense
-prefill kernel。支持边界见固定提交的
-[FlashMLA support matrix](https://github.com/deepseek-ai/FlashMLA/blob/15f13e5030374295491c5ce31b02d7e63a7772c6/README.md#requirements)。
+## 2. Insight 1：随机离散访存的 decode 吞吐随 H 保持稳定
 
-Correctness 中 dense multi-query 路径对 prefix+chunk FP32 reference 的元素
-通过率为 100%，`max_abs=1.706e-3`、cosine diff `1.598e-6`。新增的
-Q8×KV8 kernel 对 selected-token FP32 reference 同样为 100% 元素通过，
-`max_abs=7.553e-5`、cosine diff `1.009e-4`。完整测试为 12/12 通过。
+先考虑一个更基础的问题：当每个 query 固定读取 2,048 个离散 KV token 时，历史
+地址空间从 4K 扩大到 512K，这种 token 粒度的稀疏访问是否足以让 kernel
+持续变慢？
 
-## Figure 2 TFLOPS 口径
+我们用 FlashMLA FP8 sparse decode 做对照。每个 sequence 的 `Q=1`，使用
+独立的确定性互质步长 index；每次仍读取 2,048 个 KV。为统一每次调用的 cache
+起点，每个 timed call 前都读取 256 MiB flush buffer。下图固定
+batch size，展示 H 从 4K 到 512K 的绝对 selected-pair TFLOPS。
 
-本 README 的纵坐标按 ECHO Figure 2 所称的 **hardware utilization in
-TFLOPS** 重新计算，不再使用端到端有效 TFLOPS。依据 FlashMLA 固定提交的
-[dense benchmark](https://github.com/deepseek-ai/FlashMLA/blob/15f13e5030374295491c5ce31b02d7e63a7772c6/tests/test_flash_mla_dense_decoding.py)，
-dense 只计 `flash_fwd_splitkv_mla_kernel` 主 kernel 时间，工作量为：
+![Random-index decode history scaling](artifacts/figures/main/random_decode_history.png)
+
+在 `B={1,8,16,32,64}` 下，512K/4K 吞吐比分别为
+`0.980x / 0.985x / 0.991x / 0.988x / 0.989x`；每条曲线全区间的最大波动均低于
+`2.9%`。这组结果将随 H 增长的吞吐波动限制在 3% 以内，说明更长的 H 和
+更分散的 token 地址对 decode 吞吐的影响很小。
+
+这组实验聚焦随机 index 在各 H 下的相对变化。随机 index 与连续 index 的绝对
+开销属于另一项对照；decode 与 prefill 的绝对吞吐也分别对应各自的 kernel。
+因此这里的证据边界是：随机离散访存在 decode 中呈现稳定的 history scaling，
+prefill 的内部瓶颈由后续实验继续识别。
+
+## 3. Insight 2：Prefill 吞吐在 H 增长过程中下降
+
+下图展示基线实验：固定新增长度 `Q=512`，每个面板固定一个 batch size，
+横轴为历史 KV 长度 H，纵轴为绝对 selected-pair TFLOPS。蓝线使用仓库早期所称
+的 random index，实际为确定性的互质步长构造。
+
+![Random-index prefill history scaling](artifacts/figures/main/random_prefill_q512.png)
+
+所有 batch 下都能观察到相同趋势：2K–32K 区间的吞吐相对稳定，H 达到 64K
+后开始持续下降。由于每个点的 top-k 和名义 FLOPs 相同，这张图建立了待解释
+的现象：更长的 history 使同一 sparse-prefill kernel 完成相同 selected-pair
+计算所需的时间增加。后续实验继续识别这一现象的来源。
+
+## 4. CSA 激活规律来自哪里
+
+CSA profile 来自公开数据集
+[fxiaoO/deepseek-v4-flash-swebench-csa-topk](https://modelscope.cn/datasets/fxiaoO/deepseek-v4-flash-swebench-csa-topk)。
+本仓库从中选取 8 条长度分层 trace，prompt 覆盖约 6.9K–73.7K token。每个
+trace row 含 512 个 C4 compressed entry；replay 时每个 entry 展开为 4 个连续
+token index，以保持 2,048 top-k 和相同的 set-overlap 比例。
+
+按 history 聚合后，相邻 query overlap 的总体 P50 为：
+
+| History bin | 2K–8K | 8K–16K | 16K–32K | 32K–64K | 64K+ |
+|---|---:|---:|---:|---:|---:|
+| Adjacent overlap P50 | 85.0% | 73.4% | 65.8% | 63.1% | 56.1% |
+
+![CSA overlap by history](artifacts/figures/main/csa_overlap_by_history.png)
+
+Assistant span 在长 history 下保留更多复用，prefill-equivalent span 下降更快。
+这种相关性延伸到更远的 query row：query lag 从 1 增长到 256 时，各 history
+档的 overlap 都平滑衰减。
+
+![CSA overlap by query lag](artifacts/figures/main/csa_overlap_by_query_lag.png)
+
+由此得到一个待验证的机制猜想：H 增长过程中，每个 query 的 selected-KV 数量
+保持 2,048，同时 index 的候选地址空间持续扩大；如果相邻 query 的激活集合变得更少
+重叠，那么单次 prefill 需要访问的 unique KV 工作集就会增大，原有的数据复用
+也会减弱。Trace 统计为这个机制猜想提供了相关性证据，下面继续用相同 kernel
+做 trace replay、完整网格仿真和 row-order 干预。
+
+这些统计数据完整保存在
+[`artifacts/data/csa_trace_profile/raw/`](artifacts/data/csa_trace_profile/raw/)，
+2.6GB 原始 NPZ 保存在仓库外的本机归档中。
+
+## 5. 从真实窗口到完整网格
+
+### Trace replay
+
+第一步直接截取真实 trace 的 `[H-Q,H)` 窗口并送入相同 Q8KV8 kernel。网格覆盖
+`B={1,8,32,128}`、`Q={64,256,1K,2K}` 和
+`H={8K,16K,32K,64K}`，得到 64 个完整双 pass 配对。
+
+CSA replay/random TFLOPS 中位数为 `1.020x`；按 H 分组依次为
+`1.004x / 1.012x / 1.022x / 1.098x`。短 history 差异很小，64K 时 CSA trace
+保留的跨-query复用开始形成稳定收益。完整绝对吞吐图见
+[`artifacts/figures/supplement/csa_trace_replay_throughput.png`](artifacts/figures/supplement/csa_trace_replay_throughput.png)。
+
+### CSA profile simulation
+
+为了覆盖 2K–512K，本仓库按 history bin 从 trace 提取三类统计量：
+
+1. 相邻 query 的 selected-entry overlap。
+2. Selected entry 相对当前 query 的年龄 CDF。
+3. 连续 C4 entry 的簇集比例。
+
+模拟器以 Markov 方式逐 query 生成 512 个 C4 entry，再展开为 2,048 个 token
+index；每个 batch element 使用独立 seed，使各 sequence 拥有独立模板。
+
+完整网格为：
 
 ```text
-dense Figure 2 FLOPs = 2 * B * Q * cache_seqlen * h_q * (d_qk + d_v)
-cache_seqlen          = H                  (Q=1 decode)
-                      = H+Q                (Q>1 multi-query extension)
+B = 1,2,4,8,16,32,64,128
+Q = 2,8,32,128,512,1K,4K
+H = 2K,4K,8K,16K,32K,64K,128K,256K,512K
 ```
 
-Sparse 沿用固定提交的
-[sparse benchmark counting](https://github.com/deepseek-ai/FlashMLA/blob/15f13e5030374295491c5ce31b02d7e63a7772c6/tests/lib.py)：
-只计实际选择的最多 2048 个 KV。Sparse decode 计 split-to-combine 时间，
-sparse prefill 计 `sparse_attn_fwd` kernel 时间。论文图见
-[ECHO Figure 2](https://www.usenix.org/system/files/osdi26-liu-guangda.pdf)。
+504 个目标 shape 中有 502 个 random/simulated 配对；另外两个是旧 random
+基线的显存边界。全部 1,004 个 CSA case 均有正序和倒序，最终 spread 最大
+`4.87%`。Simulated/random 中位数为 `1.030x`。
 
-这是 benchmark 的名义工作量口径。尤其在 `Q>1` 且 `Q` 相对 `H` 很大时，
-dense 分子按完整矩形计数，包含 causal mask 跳过的上三角，因此可能超过
-`989.5 TFLOPS` 的 H100 参考分母；这不代表 H800 的真实物理吞吐超过该峰值。
-原先按 causal attended pairs 和完整调用时间计算的值仍保存在
-`effective_e2e_tflops`，但不用于本 README 的图。
+真实 trace 覆盖到 64K，166 个更长 history 的点固定使用 `64K+` profile。
+因此 128K–512K 的结果属于规律外推，真实 trace replay 的范围止于 64K。
 
-## 参数网格
+## 6. 最终验证：激活分布与 Query row 邻近性
 
-- Batch：`1, 2, 4, 8, 16, 32, 64, 128, 256`
-- 历史长度：`2K, 4K, 8K, 16K, 32K, 64K, 128K, 256K, 512K`
-- 每 batch 新增长度：`1`（decode）、`2, 4, 8, 16, 32, 64, 128, 256, 512, 1K, 2K, 4K, 8K, 16K, 32K`
-- 每个 `(B,Q,H)` 都分别记录 dense 和 sparse，共 2,592 个目标点
+CSA profile 默认的 batch-outer 顺序是：
 
-本次补测已删除 `B*Q<=32768` 和固定 60 GiB 两个人工门槛。regular case
-仅在估算的实际 live tensors 超过运行时可用显存（约 78.6 GiB）时预检为
-`skipped_memory_limit`；若分配或量化真实触发 CUDA OOM，则标记该点，并停止
-同一 `(backend,B,Q)` 曲线的更大历史点。regular sparse index tensor 按
-`B*Q*2048*4` bytes 计入实际显存需求，不再另设工作量上限。
+```text
+b0q0, b0q1, ..., b1q0, b1q1, ...
+```
 
-Full-topk 只是独立诊断代理，仍保留 4 GiB index tensor 和 8K 最大可见长度
-边界，不进入本 README 的 2,592 点 dense/sparse 主网格。图中的灰色 `x`
-表示物理显存不足或真实 CUDA OOM，不代表 0 TFLOPS。
+我们保持 KV、逻辑 index、FLOPs 和 kernel 完全固定，同步置换 Q 与 indices，
+构造 batch-inner：
 
-## 覆盖结果
+```text
+b0q0, b1q0, ..., b0q1, b1q1, ...
+```
 
-本次报告专用数据集有 2,592/2,592 个目标点，0 missing：
+逆置换输出后，两种布局逐元素一致，`max_abs=0`。502/502 个 shape 完整配对，
+batch-inner 双 pass spread P95/最大值为 `2.98% / 4.69%`。
 
-| Q | 模式 | 成功 | 物理 OOM | Dense 最大 B（任一 H / 全 H） | Sparse 最大 B（任一 H / 全 H） |
-|---:|---|---:|---:|---:|---:|
-| 1 | decode | 160 | 2 | 256 / 128 | 256 / 128 |
-| 2 | chunk | 160 | 2 | 256 / 128 | 256 / 128 |
-| 4 | chunk | 160 | 2 | 256 / 128 | 256 / 128 |
-| 8 | chunk | 160 | 2 | 256 / 128 | 256 / 128 |
-| 16 | chunk | 160 | 2 | 256 / 128 | 256 / 128 |
-| 32 | chunk | 160 | 2 | 256 / 128 | 256 / 128 |
-| 64 | chunk | 160 | 2 | 256 / 128 | 256 / 128 |
-| 128 | chunk | 159 | 3 | 256 / 128 | 256 / 128 |
-| 256 | chunk | 157 | 5 | 256 / 64 | 256 / 128 |
-| 512 | chunk | 156 | 6 | 256 / 64 | 256 / 64 |
-| 1K | chunk | 154 | 8 | 256 / 64 | 256 / 64 |
-| 2K | chunk | 144 | 18 | 128 / 64 | 256 / 64 |
-| 4K | chunk | 129 | 33 | 64 / 32 | 128 / 64 |
-| 8K | chunk | 113 | 49 | 32 / 16 | 64 / 32 |
-| 16K | chunk | 97 | 65 | 16 / 16 | 32 / 16 |
-| 32K | chunk | 80 | 82 | 8 / 8 | 16 / 8 |
+下图把最初的 random baseline、CSA batch-outer 和 CSA batch-inner 放在同一组
+绝对 TFLOPS 纵轴上。三条曲线的 kernel、top-k 和名义 FLOPs 相同；绿色与蓝色
+对应两种 index 激活分布，橙色与绿色对应两种 Q/indices row order。
 
-总计 2,309 个成功测量、283 个明确的物理显存边界、0 missing、0 时间预算
-跳过、0 最终 kernel failure。283 个边界均由 live-tensor 预检判定；经过
-chunked FP8 cache 量化修正后，最终主数据中没有分配阶段的 CUDA OOM。表中
-“全 H”表示该 batch 在 2K 到 512K 九个历史点全部
-成功。图中 TFLOPS 使用上述 Figure 2 hardware-utilization 口径；sparse 只计
-最多 2048 个 KV，因此还应结合 CSV 中的 latency、pairs 和
-`effective_e2e_tflops` 查看。
+![Random and CSA row-layout validation](artifacts/figures/main/random_csa_row_layout_q512.png)
 
-最终 profiler 最大值：decode dense `383.2 TFLOPS`，decode sparse
-`339.2 TFLOPS`；prefill dense 矩形名义值 `1151.5 TFLOPS`，prefill sparse
-`649.5 TFLOPS`。按固定 `(backend,B,Q)` 的历史曲线检查相邻点，未发现低于
-相邻几何均值 75% 的孤立性能突降。一次持续满载导致的 dense 热降频点已在
-42°C 冷机状态下从 `358.3` 重测为 `665.1 TFLOPS`，最终图使用后者。
+| Batch | 1 | 8 | 16 | 32 | 64 | 128 |
+|---|---:|---:|---:|---:|---:|---:|
+| Inner/outer TFLOPS | 1.001x | 0.985x | 0.949x | 0.908x | 0.857x | 0.781x |
 
-## SGLang Q8×KV8 Sparse Prefill 重测
+总体中位数为 `0.974x`；`B>=64,Q>=512` 子集为 `0.778x`。Batch-inner 将同一
+sequence 的 query 分隔开，吞吐下降随 batch 显著放大。这个干预保留硬件 L2，
+CTA 调度仍由 kernel 决定，因此结果刻画的是 row-order locality；L2 hit/miss
+的定量归因需要 NCU counter。
 
-使用 SGLang commit `5d85f25f75b6b6c937ac85bdc57ba0d19ebbbd7c` 的
-[原生 SM90 Q8×KV8 sparse prefill kernel](https://github.com/sgl-project/sglang/blob/5d85f25f75b6b6c937ac85bdc57ba0d19ebbbd7c/python/sglang/kernels/ops/attention/sparse_mla_q8kv8_prefill_sm90.py)
-重测上述完整 prefill 网格。vendored 8 个 CUDA/header 文件在启动时逐个校验
-Git blob SHA1；JIT 只编译 `sm_90a`。
+其他 Q 的完整三线图见
+[`artifacts/figures/supplement/`](artifacts/figures/supplement/)。
 
-该 kernel 直接接收 contiguous `float8_e4m3fn` Q 和 KV，以及
-`int32 [B*Q,1,2048]` causal indices。Q/KV 的 FP8 转换、indices 和首次 JIT
-均不在 CUDA event 计时区间内，并分别记录在 setup latency。这里测的是
-Q8×KV8 attention kernel，不是 SGLang 端到端 scheduler，也不是 decode 使用的
-656-byte paged FP8 KV layout。
+## 7. 结论与边界
 
-完整 Q8 网格共 1,215 点：1,116 成功、99 个明确显存边界、0 kernel failure、
-0 时间预算跳过。99 个显存边界中 6 个由真实 CUDA allocation OOM 触发；其余
-在分配前由实际 live-tensor 估算判定。Q8 最大吞吐为 `728.7 TFLOPS`。
+本仓库的证据支持以下解释：
 
-与旧 FlashMLA BF16 sparse prefill 有 1,094 个同 shape 可比点。按实际选择的
-最多 2048 KV 计算 FLOPs，并除以单个 attention kernel 时间，Q8×KV8 的中位
-吞吐为 BF16 的 `1.263×`。按 history 分组，中位比值从 2K 的 `1.185×` 增至
-512K 的 `1.478×`。在同时覆盖 2K 和 512K 的 107 条 `(B,Q)` 曲线上，Q8
-吞吐的 512K/2K 中位比值为 `0.731`，BF16 为 `0.587`：FP8 减轻了长 history
-下的稀疏访存损失，但没有消除该趋势。
+- 固定 top-k 后，名义 attention FLOPs 与 H 无关。
+- 随机 index decode 在 H=4K–512K 内保持稳定，扩大离散地址范围带来的吞吐波动
+  低于 2.9%。
+- H 扩大可寻址空间，并伴随 CSA selected-set overlap 和近期 KV 占比下降。
+- 激活规律决定一次 prefill 的 unique KV 工作集，对应 random 与 CSA 的曲线差异。
+- 同一逻辑 index 下，row order 足以在高 batch/大 Q 时产生约 22% 的吞吐差异。
 
-![Q8xKV8 vs BF16 throughput ratio](assets/q8kv8/figures/q8kv8_vs_bf16_speedup.png)
+当前证据来自端到端 kernel timing。L2 miss、HBM traffic、TLB、sector efficiency
+和 long-scoreboard stall 的占比需要 NCU counter 进一步分解。本文使用 CSA 作为
+DSA 的代理，完整 DSA 实现可能采用其他检索器、top-k 语义和调度策略。
 
-下列每张图固定新增长度 Q，3×3 面板固定 batch，横轴为历史长度，纵轴为
-selected-pair TFLOPS。蓝线是旧 BF16 sparse，红线是本次 Q8×KV8；灰色 `x`
-是 Q8 显存不足。PNG 和 PDF 均已生成。
+## 复现与数据
 
-| Q=2 | Q=4 |
-|---|---|
-| ![Q8 Q=2](assets/q8kv8/figures/q8kv8_history_scaling_q2.png) | ![Q8 Q=4](assets/q8kv8/figures/q8kv8_history_scaling_q4.png) |
-| Q=8 | Q=16 |
-| ![Q8 Q=8](assets/q8kv8/figures/q8kv8_history_scaling_q8.png) | ![Q8 Q=16](assets/q8kv8/figures/q8kv8_history_scaling_q16.png) |
-| Q=32 | Q=64 |
-| ![Q8 Q=32](assets/q8kv8/figures/q8kv8_history_scaling_q32.png) | ![Q8 Q=64](assets/q8kv8/figures/q8kv8_history_scaling_q64.png) |
-| Q=128 | Q=256 |
-| ![Q8 Q=128](assets/q8kv8/figures/q8kv8_history_scaling_q128.png) | ![Q8 Q=256](assets/q8kv8/figures/q8kv8_history_scaling_q256.png) |
-| Q=512 | Q=1K |
-| ![Q8 Q=512](assets/q8kv8/figures/q8kv8_history_scaling_q512.png) | ![Q8 Q=1K](assets/q8kv8/figures/q8kv8_history_scaling_q1024.png) |
-| Q=2K | Q=4K |
-| ![Q8 Q=2K](assets/q8kv8/figures/q8kv8_history_scaling_q2048.png) | ![Q8 Q=4K](assets/q8kv8/figures/q8kv8_history_scaling_q4096.png) |
-| Q=8K | Q=16K |
-| ![Q8 Q=8K](assets/q8kv8/figures/q8kv8_history_scaling_q8192.png) | ![Q8 Q=16K](assets/q8kv8/figures/q8kv8_history_scaling_q16384.png) |
-| Q=32K |  |
-| ![Q8 Q=32K](assets/q8kv8/figures/q8kv8_history_scaling_q32768.png) |  |
-
-## Decode / Prefill 长 history 机制实验
-
-为解释“decode 基本不随 history 变慢，而 sparse prefill 会下降”，额外运行了
-一组不依赖 NCU 的受控实验。固定 `topk=2048`，history 取 `2K/32K/512K`，
-分别控制同一 chunk 内各 query row 的 selected-KV 集合：
-
-- `shared`：所有 query row 读取同一组 KV，保持最大跨 query 重用；
-- `independent`：每个 query row 读取不同 KV，消除大部分跨 query 重用；
-- `contiguous/dispersed`：在重用条件不变时，单独改变选中地址的空间局部性；
-- `isolated`：64 个 query row 位于 64 个独立 sequence，作为无同序列重用的
-  prefill-kernel 对照；另测 native FlashMLA FP8 decode `B=64`。
-
-Q8×KV8 使用 `N=64/256` query rows，FlashMLA BF16 使用 `N=64`。每个点均做
-升序和降序 history 两遍，最终取两遍 median；同时测 steady 与每次调用前读取
-256 MiB flush buffer 的 L2-cold。共 204/204 个原始 case 成功，得到 102 个
-聚合点。升降序最大差异 `4.61%`，L2-cold/steady 的中位延迟比为 `1.015×`。
-
-| 受控 case | 512K / 2K 延迟 |
-|---|---:|
-| Q8，N=256，independent dispersed | `1.475×` |
-| Q8，N=256，shared dispersed | `1.003×` |
-| Q8，N=64，independent dispersed | `1.234×` |
-| Q8，N=64，shared dispersed | `1.003×` |
-| BF16，N=64，independent dispersed | `1.220×` |
-| BF16，N=64，shared dispersed | `1.002×` |
-| Q8 prefill kernel，64 个独立 sequence | `1.058×` |
-| native FlashMLA FP8 decode，B=64 | `1.046×` |
-
-在 Q8、`N=256,H=512K` 下，保持 selected set 完全共享、只把地址改为离散，
-延迟仅为 contiguous 的 `1.003×`；保持每行连续、只移除跨 query 重用，延迟
-升至 `1.336×`；已经移除重用后再改为离散，额外增加到 `1.097×`。对应的
-unique selected-KV working set 从 shared 的 2,048 token（50 MiB L2 的
-`0.023×`）增长到 independent contiguous 的 524,288 token（`5.760×`）。
-
-![Controlled Q8 N=256 history scaling](assets/cache_locality_clean/figures/controlled_sglang_q8kv8_n256_history.png)
-
-![Decode and prefill controls](assets/cache_locality_clean/figures/decode_vs_prefill_control.png)
-
-![Selected working set versus latency](assets/cache_locality_clean/figures/working_set_vs_latency.png)
-
-**客观结论：**history 的可寻址范围本身不是主因；主要的软件可见因素是一个
-prefill 调用内相邻 query 的 selected-KV 重叠随 history 增长而消失，导致
-unique KV working set 和实际需要服务的数据增长。地址离散/空间局部性是次要
-因素。Decode 每个 sequence 每次只有一个 query，不存在这种“原本可复用、随后
-丢失”的同序列跨 query 重用，因此保持近似平坦。L2-cold 与 steady 很接近，
-说明跨 kernel 调用的 L2 驻留也不是主因，关键重用发生在单次 kernel 内。
-
-这组实验支持“memory-hierarchy pressure 增加”，但没有 NCU counter，不能进一步
-区分 HBM 流量、L2 miss、TLB、sector efficiency 或 long-scoreboard stall 各自的
-占比，也不能把结果直接表述成已测得的“带宽利用率下降”。实验使用确定性合成
-indices；真实 indexer trace 若保留更高的相邻 query overlap，下降幅度会不同。
-完整数值和分析见
-[`assets/cache_locality_clean/analysis.md`](assets/cache_locality_clean/analysis.md)。
-
-### 相邻 Query Overlap 匹配与反向干预
-
-上述 shared/independent 极端对照证明跨-query selected-KV 重用会显著改变性能，
-但不能单独证明 `adjacent_overlap` 这一个统计量足以解释原始 history 曲线。新增
-实验复用 Q8KV8 full grid 中所有成功且 `H>2048,Q>=2` 的 shape；同一 shape 只
-分配一次 Q/KV，三组只替换 indices：
-
-| Pattern | Index 构造 | 目的 |
-|---|---|---|
-| `original_strided` | 原始 causal 互质步长 | 复现待解释曲线并计算真实相邻 overlap |
-| `matched_contiguous` | 物理连续窗口，相邻 overlap 匹配原始值 | 去除行内离散性后检验 overlap 是否足以复现性能 |
-| `inverted_contiguous` | 物理连续窗口，相邻 overlap 为 `1-original` | 构造随 history 反向变化的剂量响应 |
-
-连续窗口使用反射步进，保证每一行都是单段连续 2,048 KV，且所有位置位于历史
-prefix 内。除 `adjacent_overlap` 外同时记录全调用 `unique_kv` 和 `reuse_factor`；
-原因是相邻交集相同并不保证非相邻 query 的重用拓扑或全 chunk union 相同。
-
-本组只有在 smoke 通过并生成完整三组配对数据后才写性能结论；执行顺序为先跑
-smoke，再按 55 分钟预算跑完整 shape 集并生成图表。
-
-### Native Decode Selected-KV 重用对照
-
-进一步对 native FlashMLA FP8 sparse decode 做单次 kernel 内的重用干预。无 NCU
-无法验证“100% L2 hit/miss”，而用不同前置 kernel 预热/驱逐还会混入 GPU DVFS；
-因此最终实验让两种 case 在每次计时前都执行相同的 256 MiB flush，只改变 timed
-kernel 的物理 indices：
-
-- `shared`：所有 batch row 读取同一组 2,048 KV；
-- `independent`：每个 batch row 各自读取 2,048 KV。
-
-两者的 kernel、Q/KV allocation、batch、topk、FLOPs 和立即前置 workload 完全
-相同。`B<=64` 测完整 `H=4K..512K` 八个 history 点；另在
-`H=4K/32K/256K` 补测 `B=128/256`。所有点均做升序/降序；三个漂移超过 5% 的
-shape 以 50 repeat 重测覆盖，最终最大 pass spread 为 `3.38%`。
-
-| Batch | Independent/shared 中位延迟比 | 范围 |
-|---:|---:|---:|
-| 1 | `0.999×` | `0.997–1.001×` |
-| 8 | `1.032×` | `1.026–1.041×` |
-| 16 | `1.042×` | `1.035–1.051×` |
-| 32 | `1.059×` | `1.055–1.062×` |
-| 64 | `1.081×` | `1.074–1.091×` |
-| 128 | `1.096×` | `1.089–1.099×` |
-| 256 | `1.159×` | `1.150–1.165×` |
-
-![Native decode selected-KV reuse ratio](assets/decode_kv_reuse/figures/decode_shared_independent_ratio.png)
-
-![Native decode shared/independent latency](assets/decode_kv_reuse/figures/decode_shared_independent_latency.png)
-
-这证明 decode **可以**从 memory-hierarchy reuse 获益，因此“decode 本来完全不
-命中 L2，所以没有下降空间”不成立。但即使 `B=256` 与 controlled prefill 的
-`N=256` 对齐，decode 最大收益也只有 `1.165×`，明显低于 prefill 的
-`1.475×`。更准确的解释是：普通 decode 各 sequence 的 unique selected-KV
-数量从一开始就是 `B*2048`，而且不会随 history 增长，因此它没有一项会随
-history 逐步消失的跨-query重用；prefill 的额外下降还包含 chunk 内 unique
-working set 扩张以及 query-row并发访存组织。没有 counter 时不能把 observed
-reuse 收益全部指定为 L2。完整分析见
-[`assets/decode_kv_reuse/analysis.md`](assets/decode_kv_reuse/analysis.md)。
-
-## Sparse Decode 延迟与历史 KV
-
-下图只使用 native FlashMLA sparse FP8 decode。每张图固定一个 batch，横轴
-为历史 KV 长度，纵轴为一次 decode 调用的 median 延迟（us），阴影为 30 次
-测量的 p5-p95。灰色区域是 `skipped_memory_limit`，没有按零延迟处理。
-
-从 4K 到各 batch 最大可运行 history，median 延迟变化范围为 `-1.54%` 到
-`+2.66%`。因此在 `topk=2048` 固定后，延迟主要随 batch 增长，而没有随
-历史 KV 长度显著增长：B=1 约 33 us，B=256 的可运行点约 242-245 us。
-
-| B=1 | B=2 | B=4 |
-|---|---|---|
-| ![B=1 sparse decode latency](assets/figures/sparse_decode_latency_b1.png) | ![B=2 sparse decode latency](assets/figures/sparse_decode_latency_b2.png) | ![B=4 sparse decode latency](assets/figures/sparse_decode_latency_b4.png) |
-| B=8 | B=16 | B=32 |
-| ![B=8 sparse decode latency](assets/figures/sparse_decode_latency_b8.png) | ![B=16 sparse decode latency](assets/figures/sparse_decode_latency_b16.png) | ![B=32 sparse decode latency](assets/figures/sparse_decode_latency_b32.png) |
-| B=64 | B=128 | B=256 |
-| ![B=64 sparse decode latency](assets/figures/sparse_decode_latency_b64.png) | ![B=128 sparse decode latency](assets/figures/sparse_decode_latency_b128.png) | ![B=256 sparse decode latency](assets/figures/sparse_decode_latency_b256.png) |
-
-每个 batch 也有独立 PDF。81 个目标点的数值和 skip reason 位于
-`assets/raw/sparse_decode_latency_vs_history.csv`。
-
-## Decode TFLOPS 随 Batch 变化
-
-Decode 主图只以 batch size 为横轴。总览中的 3x3 子图分别固定九个历史
-长度；每个 history 另有独立 PNG/PDF，文件名为
-`assets/figures/tflops_vs_batch_q1_h{H}.{png,pdf}`。
-
-![Decode TFLOPS vs batch](assets/figures/tflops_vs_batch_q1_overview.png)
-
-## Prefill TFLOPS 随历史长度变化
-
-每条曲线固定 `(B,Q)`，横轴为历史 `H=2K..512K`。下面十六张总览分别固定
-新增上下文 `Q`，每张的 3x3 子图固定 batch；统一为每行两张。`Q=1` 是
-decode，其余是 chunked prefill。Q>=2 的 135 组独立图位于
-`assets/figures/prefill_tflops_vs_history_b{B}_q{Q}.{png,pdf}`。
-
-| Q=1（decode） | Q=2 |
-|---|---|
-| ![Q=1 decode history scaling](assets/figures/history_scaling_q1.png) | ![Q=2 history scaling](assets/figures/history_scaling_q2.png) |
-| Q=4 | Q=8 |
-| ![Q=4 history scaling](assets/figures/history_scaling_q4.png) | ![Q=8 history scaling](assets/figures/history_scaling_q8.png) |
-| Q=16 | Q=32 |
-| ![Q=16 history scaling](assets/figures/history_scaling_q16.png) | ![Q=32 history scaling](assets/figures/history_scaling_q32.png) |
-| Q=64 | Q=128 |
-| ![Q=64 history scaling](assets/figures/history_scaling_q64.png) | ![Q=128 history scaling](assets/figures/history_scaling_q128.png) |
-| Q=256 | Q=512 |
-| ![Q=256 history scaling](assets/figures/history_scaling_q256.png) | ![Q=512 history scaling](assets/figures/history_scaling_q512.png) |
-| Q=1K | Q=2K |
-| ![Q=1K history scaling](assets/figures/history_scaling_q1024.png) | ![Q=2K history scaling](assets/figures/history_scaling_q2048.png) |
-| Q=4K | Q=8K |
-| ![Q=4K history scaling](assets/figures/history_scaling_q4096.png) | ![Q=8K history scaling](assets/figures/history_scaling_q8192.png) |
-| Q=16K | Q=32K |
-| ![Q=16K history scaling](assets/figures/history_scaling_q16384.png) | ![Q=32K history scaling](assets/figures/history_scaling_q32768.png) |
-
-## 复现命令
+CPU 上重新生成全部博客图：
 
 ```bash
-cd /root/sparse_mla_benchmark
 ./bootstrap.sh
-.venv/bin/python test_correctness.py
-
-.venv/bin/python benchmark.py --stage full --cache-state steady --resume \
-  --skip-anchors \
-  --backend-roles decode-dense,decode-sparse,prefill-dense,prefill-sparse \
-  --batches 1,2,4,8,16,32,64,128,256 \
-  --histories 2048,4096,8192,16384,32768,65536,131072,262144,524288 \
-  --prefill-lengths 2,4,8,16,32,64,128,256,512,1024,2048,4096,8192,16384,32768 \
-  --time-budget-minutes 60
-
-.venv/bin/python profile_figure2.py --repeat 10 --resume
-.venv/bin/python plot_results.py
-
-# SGLang native SM90 Q8xKV8 sparse prefill
-.venv/bin/python benchmark.py --stage full --cache-state steady --resume \
-  --skip-anchors --backend-roles prefill-sparse \
-  --prefill-sparse-kernel q8kv8 --time-budget-minutes 60 \
-  --output-dir assets/q8kv8
-.venv/bin/python plot_q8kv8_results.py
-
-# No-NCU controlled cache-locality experiment
-.venv/bin/python cache_locality_experiment.py --stage full \
-  --warmup 10 --repeat 30 --output-dir assets/cache_locality_clean
-.venv/bin/python analyze_cache_locality.py \
-  --input assets/cache_locality_clean/raw/results.jsonl \
-  --output-dir assets/cache_locality_clean
-
-# Q8KV8 prefill adjacent-overlap matched/inverted attribution
-.venv/bin/python overlap_attribution_experiment.py --stage smoke \
-  --warmup 10 --repeat 30 --output-dir assets/overlap_attribution_smoke
-.venv/bin/python overlap_attribution_experiment.py --stage full --resume \
-  --warmup 10 --repeat 30 --time-budget-minutes 55 \
-  --output-dir assets/overlap_attribution
-.venv/bin/python analyze_overlap_attribution.py \
-  --input assets/overlap_attribution/raw/results.jsonl \
-  --output-dir assets/overlap_attribution
-
-# Native decode within-invocation selected-KV reuse
-.venv/bin/python decode_kv_reuse_experiment.py --stage full \
-  --warmup 5 --repeat 30 --output-dir assets/decode_kv_reuse
-.venv/bin/python decode_kv_reuse_experiment.py --stage full \
-  --batches 1,64 --histories 65536,262144,524288 \
-  --warmup 5 --repeat 50 --output-dir assets/decode_kv_reuse_rerun
-.venv/bin/python decode_kv_reuse_experiment.py --stage full \
-  --batches 128,256 --histories 4096,32768,262144 \
-  --warmup 5 --repeat 30 --output-dir assets/decode_kv_reuse_large_batch
-.venv/bin/python analyze_decode_kv_reuse.py \
-  --input assets/decode_kv_reuse/raw/results.jsonl \
-  --rerun-input assets/decode_kv_reuse_rerun/raw/results.jsonl \
-  --supplement-input assets/decode_kv_reuse_large_batch/raw/results.jsonl \
-  --output-dir assets/decode_kv_reuse
+PYTHON=.venv/bin/python scripts/reproduce_figures.sh
+.venv/bin/python -m tests.test_csa_trace
 ```
 
-## 数据文件
+详细 benchmark 命令见 [REPRODUCE.md](REPRODUCE.md)。权威数据约 7MB，按
+random baseline、CSA trace profile/replay、batch outer/inner 和 decode control
+分类保存在 [`artifacts/data/`](artifacts/data/)。非核心实验和原始 trace 的本机
+归档位置与校验值见 [ARCHIVE_MANIFEST.md](ARCHIVE_MANIFEST.md)。
 
-- `assets/raw/history_scaling_results.jsonl`：本 README 对应的 2,592 行完整记录
-- `assets/raw/history_scaling_results.csv`：同一数据的 CSV 版本
-- `assets/raw/history_scaling_coverage.csv`：2,592 行 decode/prefill history 轴明细
-- `assets/raw/decode_tflops_vs_batch.csv`：固定 history 的 decode batch 曲线
-- `assets/raw/figure2_metrics.jsonl`：2,309 个唯一成功点的追加式 profiler 指标
-- `assets/raw/figure2_metrics.csv`：同一 Figure 2 指标的 CSV 版本
-- `assets/raw/sparse_decode_latency_vs_history.csv`：按 batch/history 的延迟明细
-- `assets/raw/results.jsonl`：所有阶段、anchor 和早期诊断的追加式总账
-- `assets/raw/environment.json`：GPU、driver、版本、commit、wheel hash、pip freeze
-- `assets/raw/dense_sparse_comparison.csv`：同 shape dense/sparse 对照
-- `assets/raw/platform_summary.csv`：平台最大值和 batch threshold 汇总
-- `assets/q8kv8/raw/results.jsonl`：Q8×KV8 的 1,215 行完整 prefill 网格
-- `assets/q8kv8/raw/results.csv`：同一 Q8×KV8 数据的 CSV 版本
-- `assets/q8kv8/raw/q8kv8_vs_bf16_prefill.csv`：1,215 点 BF16/Q8 对照与吞吐比
-- `assets/q8kv8/raw/environment.json`：含 SGLang commit 和 8 个 source blob SHA1
-- `assets/q8kv8/figures/`：Q8×KV8 对照图的 PNG/PDF
-- `assets/cache_locality_clean/raw/results.jsonl`：204 个受控实验原始 case
-- `assets/cache_locality_clean/raw/aggregate.csv`：升降序聚合后的 102 个点
-- `assets/cache_locality_clean/raw/design.json`：局部性实验设计和固定参数
-- `assets/cache_locality_clean/analysis.md`：机制分析、比值和适用边界
-- `assets/cache_locality_clean/figures/`：五组受控实验 PNG/PDF
-- `assets/decode_kv_reuse/raw/results.jsonl`：B<=64 的 160 个原始 shared/independent case
-- `assets/decode_kv_reuse_rerun/raw/results.jsonl`：三个异常区域的 24 个 50-repeat 重测 case
-- `assets/decode_kv_reuse_large_batch/raw/results.jsonl`：B=128/256 的 12 个补测 case
-- `assets/decode_kv_reuse/raw/paired.csv`：最终覆盖规则合并后的 46 个配对点
-- `assets/decode_kv_reuse/raw/merge_manifest.json`：base/rerun/supplement 合并优先级
-- `assets/decode_kv_reuse/analysis.md`：native decode 重用实验的完整归因
+## 引用
 
-SGLang 的服务端 backend 选择和 FP8 KV 支持范围仍应参考
-[SGLang attention backend 文档](https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/attention_backend.md)。本次结果只对应上面固定 commit 的
-独立 Q8×KV8 prefill kernel 调用，不外推为端到端 SGLang 性能。
+- fxiaoO. [*deepseek-v4-flash-swebench-csa-topk*](https://modelscope.cn/datasets/fxiaoO/deepseek-v4-flash-swebench-csa-topk) [Dataset]. ModelScope, accessed 2026-08-14.
+- SGLang Q8×KV8 kernel source is vendored from commit `5d85f25f75b6b6c937ac85bdc57ba0d19ebbbd7c`; all eight Git blob hashes are verified before JIT compilation.

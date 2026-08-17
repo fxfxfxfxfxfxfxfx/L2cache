@@ -1,28 +1,12 @@
-# Recreated by bootstrap.sh
 .venv/
 .cache/
-third_party/FlashMLA/
-assets/wheels/
+build/
+runs/
+local_data/
 
-# Python and native build products
 __pycache__/
 *.py[cod]
 *.so
-build/
-dist/
 *.egg-info/
 
-# Redundant report bundles
 *.zip
-
-# Superseded, contaminated, or smoke-only measurements. Authoritative clean
-# results and reruns remain tracked.
-assets/archive/
-assets/cache_locality/
-assets/cache_locality_smoke/
-assets/decode_kv_reuse_contaminated/
-assets/decode_kv_reuse_smoke/
-assets/decode_kv_reuse_smoke_contaminated/
-assets/decode_l2_residency_*/
-assets/q8kv8_test/
-assets/q8kv8_test2/
